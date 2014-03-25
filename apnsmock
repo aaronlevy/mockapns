@@ -1,0 +1,172 @@
+#!/usr/bin/env python
+
+import argparse
+import logging
+import random
+import shlex
+import struct
+import subprocess
+import tempfile
+import time
+import uuid
+
+from gevent.queue import Queue, Empty
+from gevent.server import StreamServer
+
+APNS_ERRORS = {
+    0:'No errors encountered',
+    1:'Processing error',
+    2:'Missing device token',
+    3:'missing topic',
+    4:'missing payload',
+    5:'invalid token size',
+    6:'invalid topic size',
+    7:'invalid payload size',
+    8:'invalid token',
+    10:'Shutdown',
+    255:'Unknown'
+}
+
+
+class MockGateway(object):
+
+    def __init__(self, send_errors=False, send_feedback=False):
+        """
+        `send_errors`: Callable sends error response code if >= 0.
+        `send_feedback`: Callable returns True if token should be added to feedback
+        """
+        self.send_errors = send_errors or (lambda x: -1)
+        self.send_feedback = send_feedback or (lambda x: False)
+
+        if not callable(self.send_errors):
+            raise TypeError("Expected callable send_errors")
+
+        if not callable(self.send_feedback):
+            raise TypeError("Expected callable send_feedback")
+
+        self.feedback = Queue()
+
+    def __call__(self, sock, address):
+        logging.debug("APNS connection from %s", address)
+        buff = ''
+
+        while True:
+            try:
+                data = sock.read(1024)
+            except AttributeError:
+                return
+
+            if not data:
+                return
+
+            buff += data
+            processed = 0
+
+            while len(buff) - processed >= 45:
+                try:
+                    envelope = struct.unpack('!BIIH32sH', buff[processed:45])
+                except struct.error as e:
+                    logging.debug("Error processing payload: %s", e)
+                    return
+
+                cmd, ident, expiry, token_len, token, msg_size = envelope
+
+                try:
+                    token = token.encode('hex')
+                except ValueError as e:
+                    logging.debug("Token error: %s", e)
+                    sock.write(struct.pack('!BBI', 8, 8, ident))
+                    return
+
+                push_size = msg_size + 45
+                if len(buff) - processed < push_size:
+                    break # Get more data
+
+                msg = struct.unpack('!%ds' % msg_size, buff[processed+45:push_size])[0]
+                logging.debug("Ident: %s, expiry: %s, token: %s, msg: %s",
+                    ident, expiry, token, msg)
+
+                if self.send_feedback():
+                    self.feedback.put(token)
+
+                error = self.send_errors()
+                if 0 <= error <= 255:
+                    sock.write(struct.pack('!BBI', 8, error, ident))
+                    return
+
+                processed += push_size
+
+            buff = buff[processed:]
+
+class MockFeedback(object):
+
+    # TODO: Check the OU/CN of the client cert. Should have separate feedback queues
+
+    def __init__(self, queue):
+        self.queue = queue
+
+    def __call__(self, sock, address):
+        logging.debug("Feedback connection from %s", address)
+
+        while True:
+            try:
+                token = self.queue.get()
+            except Empty:
+                break
+
+            logging.debug("Sending feedback for token %s", token)
+            sock.write(struct.pack(
+                '!IH32s', int(time.time()), 32, token.decode('hex')))
+
+def random_error():
+    """ Respond with random error 50% of the time"""
+    return random.randint(1,8) if random.random() >= .5 else -1
+
+def random_feedback():
+    """ Add token to feedback 50% of the time"""
+    return random.random() >= .5
+
+def generate_tokens(count):
+    """ Return generator of fake device tokens """
+    return (uuid.uuid4().hex + uuid.uuid4().hex for i in xrange(count))
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Mock APNS Service")
+    parser.add_argument('--debug', action='store_true', help='Print debug messages')
+    parser.add_argument('--feedback', action='store_true', help="Add tokens to feedback service")
+    parser.add_argument('--errors', action='store_true', help="Respond with errors")
+    args = parser.parse_args()
+
+    log_level = 'DEBUG' if args.debug else 'INFO'
+    logging.basicConfig(level=log_level)
+
+    # Create temporary certificate for SSL
+    cert = tempfile.NamedTemporaryFile()
+    cid = str(uuid.uuid4())
+    subprocess.call(shlex.split(
+        'openssl req -new -x509 -subj "/C=US/ST=CA/L=SF/O=%s/CN=%s.com" ' \
+        '-keyout %s -out %s -days 365 -nodes'% (cid,cid,cert.name, cert.name)))
+
+    send_errors = random_error if args.errors else False
+    send_feedback = random_feedback if args.feedback else False
+
+    gateway = MockGateway(send_errors, send_feedback)
+    feedback = MockFeedback(gateway.feedback)
+
+    gateway_server = StreamServer(
+        ('0.0.0.0', 2195), gateway, keyfile=cert.name, certfile=cert.name)
+
+    feedback_server = StreamServer(
+        ('0.0.0.0', 2196), feedback, keyfile=cert.name, certfile=cert.name)
+
+    try:
+        logging.info("Starting Feedback service listening on 2196")
+        feedback_server.start()
+        logging.info("Starting APNS service listening on port 2195")
+        gateway_server.serve_forever()
+    finally:
+        logging.info("Shutting down")
+        gateway_server.stop()
+        feedback_server.stop()
+        cert.close()
+
