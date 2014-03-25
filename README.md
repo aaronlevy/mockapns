@@ -5,7 +5,7 @@ Mock APNs / testing server. Supports ssl connections, feedback service, and erro
 #### Usage
 
 ```
-python server.py --help
+./apnsmock --help
 ```
 
 #### Requirements
