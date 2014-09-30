@@ -35,8 +35,8 @@ class MockGateway(object):
         `send_errors`: Callable sends error response code if >= 0.
         `send_feedback`: Callable returns True if token should be added to feedback
         """
-        self.send_errors = send_errors or (lambda x: -1)
-        self.send_feedback = send_feedback or (lambda x: False)
+        self.send_errors = send_errors or (lambda: -1)
+        self.send_feedback = send_feedback or (lambda: False)
 
         if not callable(self.send_errors):
             raise TypeError("Expected callable send_errors")
